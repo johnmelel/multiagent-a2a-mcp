@@ -1,0 +1,14 @@
+gradio==6.0.1
+flask==3.1.2
+flask-cors==6.0.1
+pytest==9.0.1
+pytest-cov==7.0.0
+langchain==1.1.0
+langchain-openai==1.1.0
+python-dotenv==1.2.1
+openai==2.8.1
+mcp[cli]==1.22.0
+a2a-sdk[http-server]==0.3.19
+uvicorn==0.38.0
+starlette==0.50.0
+httpx==0.28.1
