@@ -1,44 +1,50 @@
 """
-A2A Protocol Implementation.
+A2A Protocol Implementation using the official a2a-sdk types.
 
-Defines message formats and communication protocol for agent-to-agent communication.
-This is a simple, synchronous A2A protocol using HTTP/JSON for demonstration.
+This module uses the official Google A2A SDK types for message format compatibility
+while providing simple in-process agent-to-agent communication.
+
+For HTTP-based A2A communication, use the A2AClient from the SDK directly.
 """
 
 import uuid
+import asyncio
 import json
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Callable
+
+# Official A2A SDK types for compatibility
+from a2a.types import (
+    AgentCard,
+    AgentCapabilities,
+    AgentSkill,
+    Message,
+    TextPart,
+)
+from a2a.client import A2AClient
 
 
 class MessageType(str, Enum):
     """Types of A2A messages."""
-    QUERY = "query"           # Request for information or action
-    RESPONSE = "response"     # Response to a query
-    DATA_REQUEST = "data_request"   # Request for specific data
-    DATA_RESPONSE = "data_response" # Response with data
-    TASK = "task"             # Task assignment
-    RESULT = "result"         # Task result
-    ERROR = "error"           # Error message
-    HANDOFF = "handoff"       # Handoff to another agent
+    QUERY = "query"
+    RESPONSE = "response"
+    DATA_REQUEST = "data_request"
+    DATA_RESPONSE = "data_response"
+    TASK = "task"
+    RESULT = "result"
+    ERROR = "error"
+    HANDOFF = "handoff"
 
 
 @dataclass
 class A2AMessage:
     """
-    A2A Message structure for agent-to-agent communication.
+    A2A Message wrapper for compatibility with existing agent code.
     
-    Attributes:
-        sender: Name of the sending agent
-        recipient: Name of the receiving agent
-        type: Message type (query, response, etc.)
-        payload: Message content/data
-        conversation_id: ID to track multi-step conversations
-        message_id: Unique identifier for this message
-        timestamp: When the message was created
-        metadata: Additional context or routing information
+    This wraps the official a2a-sdk Message type while maintaining
+    the interface used by our agents.
     """
     sender: str
     recipient: str
@@ -66,12 +72,62 @@ class A2AMessage:
         """Convert message to JSON string."""
         return json.dumps(self.to_dict(), indent=2)
     
+    def to_a2a_message(self) -> Message:
+        """Convert to official A2A SDK Message."""
+        text_content = json.dumps({
+            "type": self.type.value if isinstance(self.type, MessageType) else self.type,
+            "payload": self.payload,
+            "metadata": self.metadata,
+        })
+        return Message(
+            messageId=self.message_id,
+            role="user",
+            parts=[TextPart(text=text_content)],
+        )
+    
+    @classmethod
+    def from_a2a_message(cls, msg: Message, sender: str, recipient: str, conversation_id: str = None) -> "A2AMessage":
+        """Create from official A2A SDK Message."""
+        # Extract text from parts
+        text_content = ""
+        for part in msg.parts:
+            if hasattr(part, 'root') and hasattr(part.root, 'text'):
+                text_content = part.root.text
+                break
+            elif hasattr(part, 'text'):
+                text_content = part.text
+                break
+        
+        # Try to parse as JSON
+        try:
+            data = json.loads(text_content)
+            msg_type = MessageType(data.get("type", "response"))
+            payload = data.get("payload", {"text": text_content})
+            metadata = data.get("metadata", {})
+        except (json.JSONDecodeError, ValueError):
+            msg_type = MessageType.RESPONSE
+            payload = {"text": text_content}
+            metadata = {}
+        
+        return cls(
+            sender=sender,
+            recipient=recipient,
+            type=msg_type,
+            payload=payload,
+            conversation_id=conversation_id or str(uuid.uuid4()),
+            message_id=msg.messageId or str(uuid.uuid4()),
+            metadata=metadata,
+        )
+    
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "A2AMessage":
         """Create message from dictionary."""
         msg_type = data.get("type", MessageType.QUERY)
         if isinstance(msg_type, str):
-            msg_type = MessageType(msg_type)
+            try:
+                msg_type = MessageType(msg_type)
+            except ValueError:
+                msg_type = MessageType.QUERY
         
         return cls(
             sender=data["sender"],
@@ -92,49 +148,94 @@ class A2AMessage:
 
 class A2AProtocol:
     """
-    A2A Protocol handler for managing agent communication.
+    A2A Protocol handler using the official a2a-sdk types.
     
-    This is a simple in-memory implementation. In production, this could use
-    HTTP endpoints, message queues, or other transport mechanisms.
+    Provides in-process agent-to-agent communication using A2A message formats.
+    For HTTP-based communication, agents can be deployed as separate services
+    using the A2AClient from the SDK.
     """
     
-    def __init__(self):
-        """Initialize the protocol handler."""
+    def __init__(self, base_port: int = 9000):
+        """
+        Initialize the protocol.
+        
+        Args:
+            base_port: Starting port for agent servers (for future HTTP support)
+        """
+        self.base_port = base_port
+        self._handlers: Dict[str, Callable] = {}
+        self._agent_cards: Dict[str, AgentCard] = {}
+        self._agent_urls: Dict[str, str] = {}
+        self._clients: Dict[str, A2AClient] = {}
         self._message_history: List[A2AMessage] = []
-        self._handlers: Dict[str, Any] = {}  # agent_name -> handler function
+        self._next_port = base_port
     
-    def register_handler(self, agent_name: str, handler) -> None:
+    def register_handler(self, agent_name: str, handler: Callable) -> None:
         """
         Register a message handler for an agent.
         
         Args:
             agent_name: Name of the agent
-            handler: Async function that processes A2AMessage and returns A2AMessage
+            handler: Async function that processes A2AMessage
         """
         self._handlers[agent_name] = handler
+        
+        # Assign port for potential HTTP deployment
+        port = self._next_port
+        self._next_port += 1
+        self._agent_urls[agent_name] = f"http://localhost:{port}"
+        
+        # Create agent card (A2A spec compliant)
+        self._agent_cards[agent_name] = AgentCard(
+            name=agent_name,
+            description=f"A2A Agent: {agent_name}",
+            url=self._agent_urls[agent_name],
+            version="1.0.0",
+            capabilities=AgentCapabilities(streaming=False, pushNotifications=False),
+            skills=[AgentSkill(id=agent_name, name=agent_name, description=f"{agent_name} agent", tags=[])],
+            defaultInputModes=["text"],
+            defaultOutputModes=["text"],
+        )
     
     def unregister_handler(self, agent_name: str) -> None:
-        """Unregister an agent's handler."""
-        if agent_name in self._handlers:
-            del self._handlers[agent_name]
+        """Unregister an agent."""
+        self._handlers.pop(agent_name, None)
+        self._agent_cards.pop(agent_name, None)
+        self._agent_urls.pop(agent_name, None)
+        self._clients.pop(agent_name, None)
+    
+    def get_agent_card(self, agent_name: str) -> Optional[AgentCard]:
+        """Get the A2A AgentCard for an agent."""
+        return self._agent_cards.get(agent_name)
+    
+    def get_client(self, agent_name: str) -> Optional[A2AClient]:
+        """Get or create A2A client for an agent (for HTTP communication)."""
+        if agent_name not in self._agent_urls:
+            return None
+        
+        if agent_name not in self._clients:
+            self._clients[agent_name] = A2AClient(
+                base_url=self._agent_urls[agent_name]
+            )
+        
+        return self._clients[agent_name]
     
     async def send_message(self, message: A2AMessage) -> Optional[A2AMessage]:
         """
         Send a message to another agent.
         
+        Uses in-process communication by directly calling the handler.
+        
         Args:
             message: The A2A message to send
             
         Returns:
-            Response message from the recipient, or None if no handler
+            Response message from the recipient
         """
-        # Log the message
         self._message_history.append(message)
         
-        # Find the recipient's handler
         handler = self._handlers.get(message.recipient)
         if handler is None:
-            # Return error message if recipient not found
             error_msg = A2AMessage(
                 sender="a2a_protocol",
                 recipient=message.sender,
@@ -145,19 +246,26 @@ class A2AProtocol:
             self._message_history.append(error_msg)
             return error_msg
         
-        # Invoke the handler and get response
-        response = await handler(message)
-        
-        if response:
-            self._message_history.append(response)
-        
-        return response
+        try:
+            response = await handler(message)
+            if response:
+                self._message_history.append(response)
+            return response
+        except Exception as e:
+            error_msg = A2AMessage(
+                sender="a2a_protocol",
+                recipient=message.sender,
+                type=MessageType.ERROR,
+                payload={"error": str(e)},
+                conversation_id=message.conversation_id,
+            )
+            self._message_history.append(error_msg)
+            return error_msg
     
     def send_message_sync(self, message: A2AMessage) -> Optional[A2AMessage]:
         """Synchronous version of send_message."""
-        import asyncio
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor() as pool:
                 future = pool.submit(asyncio.run, self.send_message(message))
@@ -166,15 +274,7 @@ class A2AProtocol:
             return asyncio.run(self.send_message(message))
     
     def get_message_history(self, conversation_id: Optional[str] = None) -> List[A2AMessage]:
-        """
-        Get message history, optionally filtered by conversation.
-        
-        Args:
-            conversation_id: Optional filter for specific conversation
-            
-        Returns:
-            List of messages
-        """
+        """Get message history."""
         if conversation_id:
             return [m for m in self._message_history if m.conversation_id == conversation_id]
         return self._message_history.copy()
@@ -186,9 +286,13 @@ class A2AProtocol:
     def get_registered_agents(self) -> List[str]:
         """Get list of registered agent names."""
         return list(self._handlers.keys())
+    
+    def get_agent_url(self, agent_name: str) -> Optional[str]:
+        """Get the URL for an agent."""
+        return self._agent_urls.get(agent_name)
 
 
-# Global protocol instance for simple in-memory communication
+# Global protocol instance
 _global_protocol: Optional[A2AProtocol] = None
 
 
